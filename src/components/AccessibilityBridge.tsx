@@ -13,6 +13,10 @@ export default function AccessibilityBridge() {
     const [transcript, setTranscript] = useState('');
     const [commandInput, setCommandInput] = useState('');
     const [agentResponse, setAgentResponse] = useState('');
+    const [isFocusMode, setIsFocusMode] = useState(false);
+    const [simplifiedContent, setSimplifiedContent] = useState('');
+    const [preWarmedSession, setPreWarmedSession] = useState<AGISession | null>(null);
+    const [isWarming, setIsWarming] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const recognitionRef = useRef<any>(null);
@@ -26,11 +30,17 @@ export default function AccessibilityBridge() {
 
             recognitionRef.current.onresult = (event: any) => {
                 const current = event.resultIndex;
-                const resultTranscript = event.results[current][0].transcript;
+                const resultTranscript = event.results[current][0].transcript.toLowerCase();
                 setTranscript(resultTranscript);
 
                 if (event.results[current].isFinal) {
-                    handleCommand(resultTranscript);
+                    if (resultTranscript.includes('focus mode') || resultTranscript.includes('simplify')) {
+                        toggleFocusMode();
+                    } else if (resultTranscript.includes('describe') || resultTranscript.includes('vision')) {
+                        describePage();
+                    } else {
+                        handleCommand(resultTranscript);
+                    }
                 }
             };
 
@@ -41,10 +51,52 @@ export default function AccessibilityBridge() {
         }
     }, []);
 
+    // Session Warming: Initialize session in the background on mount
+    useEffect(() => {
+        const warmSession = async () => {
+            setIsWarming(true);
+            try {
+                const res = await fetch('/api/agi/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ agentName: 'agi-0' }),
+                });
+                const data = await res.json();
+                if (!data.error) {
+                    setPreWarmedSession(data);
+                }
+            } catch (err) {
+                console.error('Session warming failed:', err);
+            } finally {
+                setIsWarming(false);
+            }
+        };
+
+        warmSession();
+    }, []);
+
     const startSession = async () => {
         try {
-            setStatus('working');
             setError(null);
+
+            // 1. Use pre-warmed session if available
+            if (preWarmedSession) {
+                setSession(preWarmedSession);
+                setPreWarmedSession(null);
+                setAgentResponse('Assistant Ready. Type or speak a command below.');
+                return;
+            }
+
+            // 2. If already warming, wait or show status
+            setStatus('working');
+            if (isWarming) {
+                setAgentResponse('Assistant is warming up... nearly there.');
+                // In a real app we might poll, but for now we'll just start a 
+                // fresh one if the user clicks now to ensure completion.
+            } else {
+                setAgentResponse('Initializing fresh session (30s cold start)...');
+            }
+
             const res = await fetch('/api/agi/session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -61,7 +113,7 @@ export default function AccessibilityBridge() {
         }
     };
 
-    const handleCommand = async (command: string) => {
+    const handleCommand = async (command: string, isVisionTask: boolean = false) => {
         if (!session) {
             setError('Please start the session first.');
             return;
@@ -71,7 +123,7 @@ export default function AccessibilityBridge() {
 
         try {
             setStatus('working');
-            setAgentResponse(`Executing: "${command}"...`);
+            setAgentResponse(isVisionTask ? 'Analyzing visual layout...' : `Executing: "${command}"...`);
             setCommandInput('');
 
             const res = await fetch('/api/agi/message', {
@@ -82,11 +134,47 @@ export default function AccessibilityBridge() {
             const data = await res.json();
             if (data.error) throw new Error(data.error);
 
-            setAgentResponse(data.message || 'Task completed.');
+            const responseText = data.message || 'Task completed.';
+            setAgentResponse(responseText);
+            speakResponse(responseText);
             setStatus('idle');
         } catch (err: any) {
             setError(err.message);
             setStatus('error');
+        }
+    };
+
+    const speakResponse = async (text: string) => {
+        if (!text) return;
+
+        try {
+            // 1. Try High-Fidelity Gemini Voice
+            const res = await fetch('/api/speech/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text }),
+            });
+
+            const data = await res.json();
+
+            if (data.audio) {
+                const audio = new Audio(`data:audio/wav;base64,${data.audio}`);
+                await audio.play();
+                return;
+            }
+
+            throw new Error('Gemini Voice failed, falling back...');
+        } catch (err) {
+            console.warn('Gemini Voice unavailable, falling back to system TTS:', err);
+
+            // 2. Fallback: Browser Native TTS
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 1.0;
+                utterance.pitch = 1.0;
+                window.speechSynthesis.speak(utterance);
+            }
         }
     };
 
@@ -97,6 +185,68 @@ export default function AccessibilityBridge() {
             recognitionRef.current.start();
         } else {
             setError('Speech recognition not supported.');
+        }
+    };
+
+    const describePage = async () => {
+        if (!session) {
+            setError('Please start the session first.');
+            return;
+        }
+
+        try {
+            setStatus('working');
+            setAgentResponse('Capturing screenshot and analyzing visual layout with Vision AI...');
+
+            const res = await fetch('/api/vision/describe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: session.session_id }),
+            });
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+
+            const responseText = data.description || 'Could not generate visual description.';
+            setAgentResponse(responseText);
+            speakResponse(responseText);
+            setStatus('idle');
+        } catch (err: any) {
+            setError(err.message);
+            setStatus('error');
+        }
+    };
+
+    const toggleFocusMode = async () => {
+        if (!session) {
+            setError('Please start the session first.');
+            return;
+        }
+
+        if (isFocusMode) {
+            setIsFocusMode(false);
+            setSimplifiedContent('');
+            return;
+        }
+
+        try {
+            setStatus('working');
+            setAgentResponse('Simplifying page content for Focus Mode...');
+
+            const res = await fetch('/api/vision/simplify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: session.session_id }),
+            });
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+
+            setSimplifiedContent(data.simplifiedText);
+            setIsFocusMode(true);
+            speakResponse("Focus Mode active. Here is a simplified summary of the page: " + data.simplifiedText);
+            setStatus('idle');
+        } catch (err: any) {
+            setError(err.message);
+            setStatus('error');
         }
     };
 
@@ -159,7 +309,7 @@ export default function AccessibilityBridge() {
                                 </button>
                             </div>
 
-                            <div className="grid grid-cols-2 gap-3">
+                            <div className="grid grid-cols-3 gap-3">
                                 <button
                                     onClick={startListening}
                                     className="bg-zinc-800 hover:bg-zinc-700 text-white font-black py-4 rounded-2xl transition-all border border-white/5"
@@ -168,11 +318,18 @@ export default function AccessibilityBridge() {
                                     🎙️ VOICE
                                 </button>
                                 <button
-                                    onClick={() => handleCommand("Describe the current page layout and all interactive elements.")}
+                                    onClick={describePage}
                                     className="bg-zinc-800 hover:bg-zinc-700 text-white font-black py-4 rounded-2xl transition-all border border-white/5"
                                     disabled={status !== 'idle'}
                                 >
-                                    🔍 DESCRIBE
+                                    🔍 DESC
+                                </button>
+                                <button
+                                    onClick={toggleFocusMode}
+                                    className={`font-black py-4 rounded-2xl transition-all border border-white/5 ${isFocusMode ? 'bg-primary text-black' : 'bg-zinc-800 hover:bg-zinc-700 text-white'}`}
+                                    disabled={status !== 'idle'}
+                                >
+                                    ⚡ FOCUS
                                 </button>
                             </div>
                         </div>
@@ -203,11 +360,39 @@ export default function AccessibilityBridge() {
                         </div>
 
                         {session.vnc_url ? (
-                            <iframe
-                                src={session.vnc_url}
-                                className="w-full h-full border-none"
-                                title="Agent Viewport"
-                            />
+                            <div className="relative w-full h-full">
+                                <iframe
+                                    src={session.vnc_url}
+                                    className="w-full h-full border-none"
+                                    title="Agent Viewport"
+                                />
+                                {isFocusMode && (
+                                    <div className="absolute inset-0 bg-zinc-950/90 backdrop-blur-xl z-20 p-12 overflow-y-auto animate-in fade-in duration-500">
+                                        <div className="max-w-3xl mx-auto space-y-8">
+                                            <header className="flex justify-between items-center border-b border-white/10 pb-6">
+                                                <div>
+                                                    <h2 className="text-primary font-black tracking-widest uppercase text-xs mb-1">Focus Mode Active</h2>
+                                                    <p className="text-white text-3xl font-bold">Simplified Content</p>
+                                                </div>
+                                                <button
+                                                    onClick={() => setIsFocusMode(false)}
+                                                    className="w-12 h-12 rounded-full bg-white/5 hover:bg-white/10 flex items-center justify-center text-white transition-colors"
+                                                >
+                                                    ✕
+                                                </button>
+                                            </header>
+                                            <div className="prose prose-invert prose-lg max-w-none">
+                                                <div className="text-zinc-200 leading-relaxed whitespace-pre-wrap text-xl">
+                                                    {simplifiedContent}
+                                                </div>
+                                            </div>
+                                            <footer className="pt-12 border-t border-white/10 text-center">
+                                                <p className="text-zinc-500 text-sm">Distilled by AccessAGI Cognitive Engine</p>
+                                            </footer>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
                         ) : (
                             <div className="w-full h-full flex flex-col items-center justify-center space-y-6 text-zinc-500">
                                 <svg className="w-24 h-24 opacity-20" fill="currentColor" viewBox="0 0 24 24">
